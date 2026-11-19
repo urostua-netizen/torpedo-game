@@ -16,6 +16,7 @@ import time
 
 SIZE = 9
 RADAR_LIFETIME = 2  # 索敵した後のプレイヤー行動2回まで表示
+HARD_DIRECTIONAL_RADAR_LIMIT = 3
 SHIPS_PER_FLEET = 3  # 編成可能な隻数。2隻編成でも開始できる
 DIRECTIONS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 NEIGHBORS = [(dx, dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dx or dy]
@@ -30,6 +31,14 @@ def cells_in_rect(center, width, height):
     return [(x + dx, y + dy)
             for dy in range(-(height // 2), height - height // 2)
             for dx in range(-(width // 2), width - width // 2)]
+
+
+def cells_in_line(center, direction, board_size):
+    x, y = center
+    dx, _ = direction
+    if dx:
+        return [(column, y) for column in range(board_size)]
+    return [(x, row) for row in range(board_size)]
 
 
 @dataclass
@@ -88,9 +97,15 @@ class Destroyer(Ship):
         super().__init__('駆逐艦', 'D', 1, 2, ('torpedo', 'diagonal'))
 
 
+class Dreadnought(Ship):
+    def __init__(self):
+        super().__init__('超弩級戦艦', 'W', 2, 6, ('torpedo', 'full_line'))
+
+
 SHIP_TYPES = {
     '1': AttackSubmarine, '2': StandardSubmarine, '3': NuclearSubmarine,
     '4': Carrier, '5': Scout, '6': Battleship, '7': Destroyer,
+    '8': Dreadnought,
 }
 
 
@@ -101,10 +116,10 @@ class Weapon:
     limit = None  # None: 無制限
     kind = 'attack'
 
-    def targets(self, center):
+    def targets(self, center, direction=None, board_size=SIZE):
         return [center]
 
-    def scan_cells(self, center, direction=None, hard_mode=False):
+    def scan_cells(self, center, direction=None, hard_mode=False, board_size=SIZE):
         return []
 
 
@@ -115,7 +130,7 @@ class Torpedo(Weapon):
 class DoubleTorpedo(Weapon):
     key, name, limit = 'double', '二連装魚雷', 3
 
-    def targets(self, center):
+    def targets(self, center, direction=None, board_size=SIZE):
         # 二連装は攻撃指定を2回行うため、Game側で別々の座標を受け取る
         return [center]
 
@@ -123,7 +138,7 @@ class DoubleTorpedo(Weapon):
 class CrossTorpedo(Weapon):
     key, name, limit = 'cross', '十字魚雷', 2
 
-    def targets(self, center):
+    def targets(self, center, direction=None, board_size=SIZE):
         x, y = center
         return [center] + [(x + dx, y + dy) for dx, dy in DIRECTIONS]
 
@@ -131,7 +146,7 @@ class CrossTorpedo(Weapon):
 class DiagonalTorpedo(Weapon):
     key, name, limit = 'diagonal', 'X字魚雷', 2
 
-    def targets(self, center):
+    def targets(self, center, direction=None, board_size=SIZE):
         x, y = center
         return [center] + [(x + dx, y + dy) for dy in (-1, 1) for dx in (-1, 1)]
 
@@ -139,16 +154,23 @@ class DiagonalTorpedo(Weapon):
 class LineTorpedo(Weapon):
     key, name, limit = 'line', '貫通魚雷(横3)', 2
 
-    def targets(self, center):
+    def targets(self, center, direction=None, board_size=SIZE):
         x, y = center
         return [(x + dx, y) for dx in (-1, 0, 1)]
+
+
+class FullLineTorpedo(Weapon):
+    key, name, limit = 'full_line', '斉射魚雷(1行貫通)', 2
+
+    def targets(self, center, direction=None, board_size=SIZE):
+        return cells_in_line(center, direction or (1, 0), board_size)
 
 
 class BasicRadar(Weapon):
     key, name, limit, kind = 'radar', '通常レーダー(3x3)', None, 'scan'
     hard_name = '通常レーダー(5x5)'
 
-    def scan_cells(self, center, direction=None, hard_mode=False):
+    def scan_cells(self, center, direction=None, hard_mode=False, board_size=SIZE):
         size = 5 if hard_mode else 3
         return cells_in_rect(center, size, size)
 
@@ -157,26 +179,33 @@ class WideRadar(Weapon):
     key, name, limit, kind = 'wide_radar', '広域レーダー(5x5)', 1, 'scan'
     hard_name = '広域レーダー(7x7)'
 
-    def scan_cells(self, center, direction=None, hard_mode=False):
+    def scan_cells(self, center, direction=None, hard_mode=False, board_size=SIZE):
         size = 7 if hard_mode else 5
         return cells_in_rect(center, size, size)
 
 
 class DirectionalRadar(Weapon):
     key, name, limit, kind = 'directional_radar', '方向レーダー(直線5)', 2, 'scan'
-    hard_name = '方向レーダー(直線9)'
+    hard_name = '方向レーダー(1行全索敵)'
 
-    def scan_cells(self, center, direction=None, hard_mode=False):
-        dx, dy = direction or (0, -1)
-        return [(center[0] + n * dx, center[1] + n * dy)
-                for n in range(9 if hard_mode else 5)]
+    def scan_cells(self, center, direction=None, hard_mode=False, board_size=SIZE):
+        direction = direction or (0, -1)
+        if hard_mode:
+            return cells_in_line(center, direction, board_size)
+        dx, dy = direction
+        return [(center[0] + n * dx, center[1] + n * dy) for n in range(5)]
 
 
 # TODOの例：新しい魚雷を作るには Weapon を継承して targets() を変更し、
 # WEAPONS に登録し、Shipサブクラスの weapons に key を追加する。
 WEAPONS = {w.key: w() for w in (Torpedo, DoubleTorpedo, CrossTorpedo,
                                 BasicRadar, WideRadar, DirectionalRadar,
-                                DiagonalTorpedo, LineTorpedo)}
+                                DiagonalTorpedo, LineTorpedo, FullLineTorpedo)}
+
+
+def get_weapon_display_name(key, hard_mode=False):
+    weapon = WEAPONS[key]
+    return (weapon.hard_name or weapon.name) if hard_mode else weapon.name
 
 
 @dataclass
@@ -192,6 +221,8 @@ class Fleet:
         self.size = size
         self.persistent_radar = persistent_radar
         self.ammo = {k: w.limit for k, w in WEAPONS.items()}
+        if persistent_radar:
+            self.ammo['directional_radar'] = HARD_DIRECTIONAL_RADAR_LIMIT
         self.radar_logs = []
         self.radar_contacts: dict[tuple[int, int], RadarContact] = {}
         self.radar_last_scan = None  # (兵装名, 探知した艦影マス数)
@@ -461,15 +492,20 @@ def show_boards(player, enemy, player_shots, cpu_shots, turn, reveal_enemy=False
     print('兵装: ' + ' / '.join(format_weapon_label(player, key) for key in player.available()))
 
 
-def choose_fleet(size=SIZE):
+def choose_fleet(size=SIZE, hard_mode=False):
     print('\n--- 艦隊編成 ---')
     ship_type_count = len(SHIP_TYPES)
     print(f'艦種は全{ship_type_count}種類。{size}×{size}の海域に2〜3隻を選択できます。')
     print('同じ艦種を複数選んでもOKです（例: 2 2 5）。')
     for k, ctor in SHIP_TYPES.items():
         s = ctor()
-        print(f' {k}: {s.name} ({s.width}x{s.height}) | {", ".join(WEAPONS[w].name for w in s.weapons)}')
-    print('※空母・偵察機は攻撃能力なし。通常レーダーは両艦とも無制限です。')
+        weapons = ', '.join(get_weapon_display_name(key, hard_mode) for key in s.weapons)
+        print(f' {k}: {s.name} ({s.width}x{s.height}) | {weapons}')
+    if hard_mode:
+        print('※空母・偵察機は攻撃能力なし。通常レーダー(5x5)は両艦とも無制限です。')
+        print(f'※偵察機の方向レーダーは横1行または縦1列を全索敵できます（{HARD_DIRECTIONAL_RADAR_LIMIT}回）。')
+    else:
+        print('※空母・偵察機は攻撃能力なし。通常レーダーは両艦とも無制限です。')
     print('※支援艦だけの編成も選択できますが、攻撃不能のため戦闘開始時に敗北します。')
     while True:
         s = input(f'{ship_type_count}種類から2〜3隻の番号を空白区切りで入力 (例: 1 4 5): ').strip()
@@ -567,8 +603,7 @@ def place_player_fleet(fleet, rng):
 def format_weapon_label(fleet, key):
     ammo = fleet.ammo[key]
     remaining = '∞' if ammo is None else f'残り{ammo}回'
-    weapon = WEAPONS[key]
-    name = (weapon.hard_name or weapon.name) if fleet.persistent_radar else weapon.name
+    name = get_weapon_display_name(key, fleet.persistent_radar)
     return f'{name} ({remaining})'
 
 
@@ -589,22 +624,32 @@ def perform_player_action(key, player, enemy, results, animations):
     weapon = WEAPONS[key]
     center = ask_coord('目標座標「列 行」: ', enemy.size)
     direction = None
-    if key == 'directional_radar':
+    if key in ('directional_radar', 'full_line'):
+        directions = {'w': (0, -1), 'a': (-1, 0), 's': (0, 1), 'd': (1, 0)}
+        if key == 'directional_radar' and not player.persistent_radar:
+            prompt = '探索方向 [w上/a左/s下/d右]: '
+        else:
+            action = '索敵' if key == 'directional_radar' else '斉射'
+            prompt = f'{action}するライン [w/s: 縦1列、a/d: 横1行]: '
         while True:
-            d = input('探索方向 [w上/a左/s下/d右]: ').strip().lower()
-            if d in {'w': (0, -1), 'a': (-1, 0), 's': (0, 1), 'd': (1, 0)}:
-                direction = {'w': (0, -1), 'a': (-1, 0), 's': (0, 1), 'd': (1, 0)}[d]
+            d = input(prompt).strip().lower()
+            if d == 'q':
+                raise KeyboardInterrupt
+            if d in directions:
+                direction = directions[d]
                 break
             print('w/a/s/d を入力してください。')
     extra = None
     if key == 'double':
         extra = ask_coord('2発目の目標座標「列 行」: ', enemy.size)
     # 重複や盤外を除いた「実際に処理できるマス」を先に確認する
-    targets = ([p for p in weapon.scan_cells(center, direction, hard_mode=player.persistent_radar)
-                if in_bounds(p, enemy.size)]
-               if weapon.kind == 'scan' else
-               [p for p in weapon.targets(center) + ([extra] if extra else []) if in_bounds(p, enemy.size)])
-    targets = list(dict.fromkeys(targets))
+    if weapon.kind == 'scan':
+        cells = weapon.scan_cells(center, direction, hard_mode=player.persistent_radar, board_size=enemy.size)
+    else:
+        cells = weapon.targets(center, direction=direction, board_size=enemy.size)
+        if extra is not None:
+            cells.append(extra)
+    targets = list(dict.fromkeys(p for p in cells if in_bounds(p, enemy.size)))
     if weapon.kind == 'attack' and all(p in results for p in targets):
         print('その範囲はすでに攻撃済み。弾薬を消費せず選び直せます。')
         return False
@@ -612,7 +657,7 @@ def perform_player_action(key, player, enemy, results, animations):
         print('この兵装は使用できません。')
         return False
     if weapon.kind == 'scan':
-        name = (weapon.hard_name or weapon.name) if player.persistent_radar else weapon.name
+        name = get_weapon_display_name(key, player.persistent_radar)
         count = player.record_radar_scan(targets, enemy.occupied(), name)
         print(f'索敵結果: {len(targets)}マスを調査。艦影反応 {count} マス。')
         player.radar_logs.append((key, center, count))
@@ -677,7 +722,7 @@ def make_debug_enemy_fleet(size):
 def make_cpu_fleet(rng, size=SIZE):
     # 攻撃可能艦は必ず含める（プレイヤー側は空母だけの編成も許可）
     attackers = [AttackSubmarine, StandardSubmarine, NuclearSubmarine, Battleship, Destroyer]
-    pool = list(SHIP_TYPES.values())
+    pool = [AttackSubmarine, StandardSubmarine, NuclearSubmarine, Carrier, Scout, Battleship, Destroyer]
     classes = [rng.choice(attackers), rng.choice(pool), rng.choice(pool)]
     fleet = Fleet([c() for c in classes], size)
     try:
@@ -720,7 +765,8 @@ def run_game(rng, animations=True, auto_demo=False, debug_size=None):
                   '敵艦隊の編成は公開、位置は秘密です。')
             difficulty = choose_difficulty()
         print('命中X / 外れo / 至近弾? （周囲8マス以内に艦影あり）')
-        player = Fleet(choose_fleet(size), size, persistent_radar=difficulty == 'hard')
+        hard_mode = difficulty == 'hard'
+        player = Fleet(choose_fleet(size, hard_mode=hard_mode), size, persistent_radar=hard_mode)
         place_player_fleet(player, rng)
     if debug_size:
         enemy = make_debug_enemy_fleet(debug_size)
