@@ -97,13 +97,14 @@ SHIP_TYPES = {
 class Weapon:
     key = ''
     name = ''
+    hard_name = None
     limit = None  # None: 無制限
     kind = 'attack'
 
     def targets(self, center):
         return [center]
 
-    def scan_cells(self, center, direction=None):
+    def scan_cells(self, center, direction=None, hard_mode=False):
         return []
 
 
@@ -145,24 +146,30 @@ class LineTorpedo(Weapon):
 
 class BasicRadar(Weapon):
     key, name, limit, kind = 'radar', '通常レーダー(3x3)', None, 'scan'
+    hard_name = '通常レーダー(5x5)'
 
-    def scan_cells(self, center, direction=None):
-        return cells_in_rect(center, 3, 3)
+    def scan_cells(self, center, direction=None, hard_mode=False):
+        size = 5 if hard_mode else 3
+        return cells_in_rect(center, size, size)
 
 
 class WideRadar(Weapon):
     key, name, limit, kind = 'wide_radar', '広域レーダー(5x5)', 1, 'scan'
+    hard_name = '広域レーダー(7x7)'
 
-    def scan_cells(self, center, direction=None):
-        return cells_in_rect(center, 5, 5)
+    def scan_cells(self, center, direction=None, hard_mode=False):
+        size = 7 if hard_mode else 5
+        return cells_in_rect(center, size, size)
 
 
 class DirectionalRadar(Weapon):
     key, name, limit, kind = 'directional_radar', '方向レーダー(直線5)', 2, 'scan'
+    hard_name = '方向レーダー(直線9)'
 
-    def scan_cells(self, center, direction=None):
+    def scan_cells(self, center, direction=None, hard_mode=False):
         dx, dy = direction or (0, -1)
-        return [(center[0] + n * dx, center[1] + n * dy) for n in range(5)]
+        return [(center[0] + n * dx, center[1] + n * dy)
+                for n in range(9 if hard_mode else 5)]
 
 
 # TODOの例：新しい魚雷を作るには Weapon を継承して targets() を変更し、
@@ -180,9 +187,10 @@ class RadarContact:
 
 
 class Fleet:
-    def __init__(self, ships, size=SIZE):
+    def __init__(self, ships, size=SIZE, persistent_radar=False):
         self.ships = ships
         self.size = size
+        self.persistent_radar = persistent_radar
         self.ammo = {k: w.limit for k, w in WEAPONS.items()}
         self.radar_logs = []
         self.radar_contacts: dict[tuple[int, int], RadarContact] = {}
@@ -190,6 +198,8 @@ class Fleet:
 
     def advance_radar_time(self):
         """プレイヤーの有効な行動が1回終わったら既存の探知情報を減衰させる。"""
+        if self.persistent_radar:
+            return
         expired = []
         for p, contact in self.radar_contacts.items():
             contact.remaining -= 1
@@ -439,9 +449,12 @@ def show_boards(player, enemy, player_shots, cpu_shots, turn, reveal_enemy=False
         print(f'{a:<{left_width}} {b}'.rstrip())
     print('表示: X 命中  o 外れ  ? 至近弾  ^ 艦影反応  - 反応なし  . 未調査')
     if player.radar_contacts:
-        contact_counts = Counter(c.remaining for c in player.radar_contacts.values())
-        time_info = ' / '.join(f'残り{n}行動:{count}マス' for n, count in sorted(contact_counts.items()))
-        print(f'レーダー情報（探知位置を一時表示）: {time_info}')
+        if player.persistent_radar:
+            print(f'レーダー探知済み: {len(player.radar_contacts)}マス（永続表示）')
+        else:
+            contact_counts = Counter(c.remaining for c in player.radar_contacts.values())
+            time_info = ' / '.join(f'残り{n}行動:{count}マス' for n, count in sorted(contact_counts.items()))
+            print(f'レーダー情報（探知位置を一時表示）: {time_info}')
         if player.radar_last_scan:
             name, count = player.radar_last_scan
             print(f'直近の索敵: {name} / 艦影反応 {count}マス')
@@ -554,7 +567,9 @@ def place_player_fleet(fleet, rng):
 def format_weapon_label(fleet, key):
     ammo = fleet.ammo[key]
     remaining = '∞' if ammo is None else f'残り{ammo}回'
-    return f'{WEAPONS[key].name} ({remaining})'
+    weapon = WEAPONS[key]
+    name = (weapon.hard_name or weapon.name) if fleet.persistent_radar else weapon.name
+    return f'{name} ({remaining})'
 
 
 def offer_weapon(fleet):
@@ -585,7 +600,8 @@ def perform_player_action(key, player, enemy, results, animations):
     if key == 'double':
         extra = ask_coord('2発目の目標座標「列 行」: ', enemy.size)
     # 重複や盤外を除いた「実際に処理できるマス」を先に確認する
-    targets = ([p for p in weapon.scan_cells(center, direction) if in_bounds(p, enemy.size)]
+    targets = ([p for p in weapon.scan_cells(center, direction, hard_mode=player.persistent_radar)
+                if in_bounds(p, enemy.size)]
                if weapon.kind == 'scan' else
                [p for p in weapon.targets(center) + ([extra] if extra else []) if in_bounds(p, enemy.size)])
     targets = list(dict.fromkeys(targets))
@@ -596,10 +612,14 @@ def perform_player_action(key, player, enemy, results, animations):
         print('この兵装は使用できません。')
         return False
     if weapon.kind == 'scan':
-        count = player.record_radar_scan(targets, enemy.occupied(), weapon.name)
+        name = (weapon.hard_name or weapon.name) if player.persistent_radar else weapon.name
+        count = player.record_radar_scan(targets, enemy.occupied(), name)
         print(f'索敵結果: {len(targets)}マスを調査。艦影反応 {count} マス。')
         player.radar_logs.append((key, center, count))
-        print(f'艦影あり ^ / 反応なし - を表示（探索後の{RADAR_LIFETIME}行動まで有効）。')
+        if player.persistent_radar:
+            print(f'レーダー探知済み: {len(player.radar_contacts)}マス（永続表示）。艦影あり ^ / 反応なし -')
+        else:
+            print(f'艦影あり ^ / 反応なし - を表示（探索後の{RADAR_LIFETIME}行動まで有効）。')
         return True
     # 攻撃前の情報を使って座標を選べるよう、攻撃成立後に寿命を進める。
     player.advance_radar_time()
@@ -700,7 +720,7 @@ def run_game(rng, animations=True, auto_demo=False, debug_size=None):
                   '敵艦隊の編成は公開、位置は秘密です。')
             difficulty = choose_difficulty()
         print('命中X / 外れo / 至近弾? （周囲8マス以内に艦影あり）')
-        player = Fleet(choose_fleet(size), size)
+        player = Fleet(choose_fleet(size), size, persistent_radar=difficulty == 'hard')
         place_player_fleet(player, rng)
     if debug_size:
         enemy = make_debug_enemy_fleet(debug_size)
