@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, deque
 from dataclasses import dataclass, field
+from itertools import zip_longest
 import random
 import time
 
@@ -77,9 +78,19 @@ class Scout(Ship):
         super().__init__('偵察機', 'P', 1, 1, ('radar', 'wide_radar', 'directional_radar'))
 
 
+class Battleship(Ship):
+    def __init__(self):
+        super().__init__('戦艦', 'B', 2, 5, ('torpedo', 'line'))
+
+
+class Destroyer(Ship):
+    def __init__(self):
+        super().__init__('駆逐艦', 'D', 1, 2, ('torpedo', 'diagonal'))
+
+
 SHIP_TYPES = {
     '1': AttackSubmarine, '2': StandardSubmarine, '3': NuclearSubmarine,
-    '4': Carrier, '5': Scout,
+    '4': Carrier, '5': Scout, '6': Battleship, '7': Destroyer,
 }
 
 
@@ -116,6 +127,22 @@ class CrossTorpedo(Weapon):
         return [center] + [(x + dx, y + dy) for dx, dy in DIRECTIONS]
 
 
+class DiagonalTorpedo(Weapon):
+    key, name, limit = 'diagonal', 'X字魚雷', 2
+
+    def targets(self, center):
+        x, y = center
+        return [center] + [(x + dx, y + dy) for dy in (-1, 1) for dx in (-1, 1)]
+
+
+class LineTorpedo(Weapon):
+    key, name, limit = 'line', '貫通魚雷(横3)', 2
+
+    def targets(self, center):
+        x, y = center
+        return [(x + dx, y) for dx in (-1, 0, 1)]
+
+
 class BasicRadar(Weapon):
     key, name, limit, kind = 'radar', '通常レーダー(3x3)', None, 'scan'
 
@@ -141,7 +168,8 @@ class DirectionalRadar(Weapon):
 # TODOの例：新しい魚雷を作るには Weapon を継承して targets() を変更し、
 # WEAPONS に登録し、Shipサブクラスの weapons に key を追加する。
 WEAPONS = {w.key: w() for w in (Torpedo, DoubleTorpedo, CrossTorpedo,
-                                BasicRadar, WideRadar, DirectionalRadar)}
+                                BasicRadar, WideRadar, DirectionalRadar,
+                                DiagonalTorpedo, LineTorpedo)}
 
 
 @dataclass
@@ -244,10 +272,12 @@ class Fleet:
 
 
 class CPU:
-    def __init__(self, rng, size=SIZE):
+    def __init__(self, rng, size=SIZE, difficulty='normal'):
         self.rng, self.size = rng, size
+        self.difficulty = difficulty
         self.tried = set()
         self.priority = deque()
+        self.hit_history = set()
 
     def choose_target(self):
         while self.priority:
@@ -263,11 +293,56 @@ class CPU:
         self.tried.add(p)
         return p
 
-    def feedback(self, p, result):
+    def feedback(self, p, result, sunk_positions=None):
+        if self.difficulty == 'easy':
+            return
+        if self.difficulty == 'hard':
+            if result == 'sunk':
+                self.clear_sunk_tracking(p, sunk_positions)
+                return
+            if result == 'hit':
+                self.track_hit(p)
+                return
         if result in ('hit', 'near'):
             candidates = [(p[0] + dx, p[1] + dy) for dx, dy in NEIGHBORS]
             self.rng.shuffle(candidates)
             self.priority.extend(candidates)
+
+    def track_hit(self, p):
+        self.hit_history.add(p)
+        x, y = p
+        adjacent = [(x + dx, y + dy) for dx, dy in DIRECTIONS]
+        extensions = []
+        for axis in (((1, 0), (-1, 0)), ((0, 1), (0, -1))):
+            if not any((x + dx, y + dy) in self.hit_history for dx, dy in axis):
+                continue
+            for dx, dy in axis:
+                end = x + dx, y + dy
+                while end in self.hit_history:
+                    end = end[0] + dx, end[1] + dy
+                extensions.append(end)
+        # 大型艦は複数列にまたがるので、直線候補の後に周囲4マスも残す。
+        for candidate in reversed(extensions + adjacent):
+            if in_bounds(candidate, self.size) and candidate not in self.tried:
+                self.priority.appendleft(candidate)
+
+    def clear_sunk_tracking(self, p, sunk_positions):
+        if sunk_positions is None:
+            # 座標だけを渡す既存の呼び出しでは、連結した命中マスから推定する。
+            sunk_positions = {p}
+            pending = [p]
+            while pending:
+                x, y = pending.pop()
+                for dx, dy in DIRECTIONS:
+                    neighbor = x + dx, y + dy
+                    if neighbor in self.hit_history and neighbor not in sunk_positions:
+                        sunk_positions.add(neighbor)
+                        pending.append(neighbor)
+        self.hit_history.difference_update(sunk_positions)
+        sunk_neighbors = {(x + dx, y + dy) for x, y in sunk_positions for dx, dy in DIRECTIONS}
+        live_neighbors = {(x + dx, y + dy) for x, y in self.hit_history for dx, dy in DIRECTIONS}
+        obsolete = (sunk_neighbors - live_neighbors) | sunk_positions
+        self.priority = deque(p for p in self.priority if p not in obsolete)
 
 
 DEPARTURE = r'''
@@ -326,7 +401,10 @@ def board_lines(fleet, shots=None, own=False, radar_contacts=None):
     shots = shots or {}
     occupied = {p: ship.symbol for ship in fleet.ships for p in ship.positions}
     radar_contacts = radar_contacts or {}
-    rows = ['    ' + ' '.join(str(i + 1) for i in range(fleet.size))]
+    tile_width = len(str(fleet.size))
+    row_width = max(2, tile_width)
+    rows = [' ' * (row_width + 2) +
+            ' '.join(f'{i + 1:>{tile_width}}' for i in range(fleet.size))]
     for y in range(fleet.size):
         tiles = []
         for x in range(fleet.size):
@@ -339,7 +417,8 @@ def board_lines(fleet, shots=None, own=False, radar_contacts=None):
                 tiles.append('^' if radar_contacts[p].detected else '-')
             else:
                 tiles.append('.')
-        rows.append(f'{y + 1:>2}  ' + ' '.join(tiles))
+        rows.append(f'{y + 1:>{row_width}}  ' +
+                    ' '.join(f'{tile:>{tile_width}}' for tile in tiles))
     return rows
 
 
@@ -350,9 +429,14 @@ def show_boards(player, enemy, player_shots, cpu_shots, turn, reveal_enemy=False
     print(f'\n========== TURN {turn} / 魚雷ゲーム ==========')
     print('敵艦隊: ' + enemy.summary())
     print('自艦隊: ' + player.summary())
-    print('     敵の海域（' + ('DEBUG: 艦影公開' if reveal_enemy else '配置は秘密') + '）         自艦隊（被弾状況）')
-    for a, b in zip(left, right):
-        print(f'{a:<26} {b}')
+    left_width = max(26, len(left[0]))
+    enemy_label = '敵の海域（' + ('DEBUG: 艦影公開' if reveal_enemy else '配置は秘密') + '）'
+    if player.size != enemy.size:
+        print(f'     {enemy_label} {enemy.size}×{enemy.size} / 自艦隊（被弾状況） {player.size}×{player.size}')
+    else:
+        print(f'     {enemy_label}         自艦隊（被弾状況）')
+    for a, b in zip_longest(left, right, fillvalue=''):
+        print(f'{a:<{left_width}} {b}'.rstrip())
     print('表示: X 命中  o 外れ  ? 至近弾  ^ 艦影反応  - 反応なし  . 未調査')
     if player.radar_contacts:
         contact_counts = Counter(c.remaining for c in player.radar_contacts.values())
@@ -361,13 +445,13 @@ def show_boards(player, enemy, player_shots, cpu_shots, turn, reveal_enemy=False
         if player.radar_last_scan:
             name, count = player.radar_last_scan
             print(f'直近の索敵: {name} / 艦影反応 {count}マス')
-    print('兵装: ' + ' / '.join(f'{WEAPONS[k].name}[{"∞" if player.ammo[k] is None else player.ammo[k]}]'
-                                for k in player.available()))
+    print('兵装: ' + ' / '.join(format_weapon_label(player, key) for key in player.available()))
 
 
 def choose_fleet(size=SIZE):
     print('\n--- 艦隊編成 ---')
-    print(f'艦種は全5種類。{size}×{size}の海域に2〜3隻を選択できます。')
+    ship_type_count = len(SHIP_TYPES)
+    print(f'艦種は全{ship_type_count}種類。{size}×{size}の海域に2〜3隻を選択できます。')
     print('同じ艦種を複数選んでもOKです（例: 2 2 5）。')
     for k, ctor in SHIP_TYPES.items():
         s = ctor()
@@ -375,7 +459,7 @@ def choose_fleet(size=SIZE):
     print('※空母・偵察機は攻撃能力なし。通常レーダーは両艦とも無制限です。')
     print('※支援艦だけの編成も選択できますが、攻撃不能のため戦闘開始時に敗北します。')
     while True:
-        s = input('5種類から2〜3隻の番号を空白区切りで入力 (例: 1 4 5): ').strip()
+        s = input(f'{ship_type_count}種類から2〜3隻の番号を空白区切りで入力 (例: 1 4 5): ').strip()
         if s.lower() == 'q':
             raise KeyboardInterrupt
         values = s.split()
@@ -385,7 +469,7 @@ def choose_fleet(size=SIZE):
                 return [SHIP_TYPES[v]() for v in values]
             print(f'この艦隊は{size}×{size}の海域に配置できません。別の編成を選んでください。')
             continue
-        print('番号1〜5の中から、2〜3隻を選んでください。')
+        print(f'番号1〜{ship_type_count}の中から、2〜3隻を選んでください。')
 
 
 def try_place_all(fleet, rng):
@@ -424,6 +508,26 @@ def try_place_all(fleet, rng):
     return False
 
 
+def preview_placement(fleet, ship, x, y, rotate):
+    """配置予定を重ねた盤面の行リストと、配置できるかどうかを返す。"""
+    positions = ship.place(x, y, rotate)
+    can_place = fleet.can_place(ship, positions)
+    rows = board_lines(fleet, own=True)
+    marker = '*' if can_place else '!'
+    for row_index in range(fleet.size):
+        row = rows[row_index + 1]
+        tiles = row[4:].split()
+        for column in range(fleet.size):
+            if (column, row_index) in positions:
+                tiles[column] = marker
+        rows[row_index + 1] = row[:4] + ' '.join(tiles)
+    if can_place:
+        rows.append('* 配置予定')
+    else:
+        rows.append('! 配置不可（盤外または艦船が重複）。')
+    return rows, can_place
+
+
 def place_player_fleet(fleet, rng):
     s = input('配置方法 [a: 自動 / m: 手動] (Enterで自動): ').strip().lower()
     if s != 'm':
@@ -436,14 +540,27 @@ def place_player_fleet(fleet, rng):
             print(f'{ship.name} ({ship.width}x{ship.height}) を配置')
             p = ask_coord('左上の座標「列 行」: ', fleet.size)
             rotate = input('90度回転しますか？ [y/N] ').strip().lower() == 'y'
-            if fleet.place(ship, *p, rotate):
+            rows, can_place = preview_placement(fleet, ship, *p, rotate)
+            print('\n'.join(rows))
+            if not can_place:
+                continue
+            confirm = input('この位置に確定しますか？ [Y/n] ').strip().lower()
+            if confirm == 'q':
+                raise KeyboardInterrupt
+            if confirm in ('', 'y', 'yes') and fleet.place(ship, *p, rotate):
                 break
-            print('そこには配置できません（盤外または艦船が重複）。')
+
+
+def format_weapon_label(fleet, key):
+    ammo = fleet.ammo[key]
+    remaining = '∞' if ammo is None else f'残り{ammo}回'
+    return f'{WEAPONS[key].name} ({remaining})'
 
 
 def offer_weapon(fleet):
     keys = fleet.available()
-    print('\n兵装選択: ' + ' / '.join(f'{i + 1}:{WEAPONS[k].name}' for i, k in enumerate(keys)))
+    print('\n兵装選択: ' + ' / '.join(
+        f'{i + 1}:{format_weapon_label(fleet, key)}' for i, key in enumerate(keys)))
     while True:
         s = input('番号を入力（q終了）: ').strip().lower()
         if s == 'q':
@@ -506,7 +623,10 @@ def cpu_turn(cpu, player, shots, animations):
         return
     outcome, sunk = player.attack(p)
     shots[p] = outcome
-    cpu.feedback(p, outcome)
+    if sunk and cpu.difficulty == 'hard':
+        cpu.feedback(p, outcome, sunk_positions=sunk.positions)
+    else:
+        cpu.feedback(p, outcome)
     print(f'敵の攻撃 ({p[0] + 1},{p[1] + 1}): ' +
           {'hit': '命中！', 'sunk': '撃沈！', 'miss': '外れ', 'near': '至近弾！'}[outcome])
     if sunk:
@@ -536,14 +656,36 @@ def make_debug_enemy_fleet(size):
 
 def make_cpu_fleet(rng, size=SIZE):
     # 攻撃可能艦は必ず含める（プレイヤー側は空母だけの編成も許可）
-    pool = [AttackSubmarine, StandardSubmarine, NuclearSubmarine, Carrier, Scout]
-    classes = [rng.choice(pool[:3]), rng.choice(pool), rng.choice(pool)]
+    attackers = [AttackSubmarine, StandardSubmarine, NuclearSubmarine, Battleship, Destroyer]
+    pool = list(SHIP_TYPES.values())
+    classes = [rng.choice(attackers), rng.choice(pool), rng.choice(pool)]
     fleet = Fleet([c() for c in classes], size)
-    fleet.random_place_all(rng)
+    try:
+        fleet.random_place_all(rng)
+    except RuntimeError:
+        if not try_place_all(fleet, rng):
+            raise
     return fleet
 
 
+def choose_difficulty():
+    while True:
+        choice = input(
+            'CPUの難易度 [1: かんたん / 2: ふつう / 3: むずかしい] (Enterでふつう、qで終了): '
+        ).strip().lower()
+        if choice == 'q':
+            raise KeyboardInterrupt
+        if choice == '1':
+            return 'easy'
+        if choice in ('', '2'):
+            return 'normal'
+        if choice == '3':
+            return 'hard'
+        print('1、2、3のいずれかを入力してください。')
+
+
 def run_game(rng, animations=True, auto_demo=False, debug_size=None):
+    difficulty = 'normal'
     if auto_demo:
         player = Fleet([AttackSubmarine(), StandardSubmarine(), Carrier()])
         player.random_place_all(rng)
@@ -554,14 +696,21 @@ def run_game(rng, animations=True, auto_demo=False, debug_size=None):
             print(f'【DEBUG {size}×{size}】敵の艦影を公開／固定配置／敵の反撃なし。')
             print('命中やレーダーの検証用です。通常モードとはルールが異なります。')
         else:
-            print('5種類の艦種から2〜3隻を選んで9x9の海域に配置。敵艦隊の編成は公開、位置は秘密です。')
+            print(f'{len(SHIP_TYPES)}種類の艦種から2〜3隻を選んで{SIZE}x{SIZE}の海域に配置。'
+                  '敵艦隊の編成は公開、位置は秘密です。')
+            difficulty = choose_difficulty()
         print('命中X / 外れo / 至近弾? （周囲8マス以内に艦影あり）')
         player = Fleet(choose_fleet(size), size)
         place_player_fleet(player, rng)
-    enemy = make_debug_enemy_fleet(debug_size) if debug_size else make_cpu_fleet(rng)
+    if debug_size:
+        enemy = make_debug_enemy_fleet(debug_size)
+    elif difficulty == 'hard':
+        enemy = make_cpu_fleet(rng, size=SIZE * 2)
+    else:
+        enemy = make_cpu_fleet(rng)
     animation(DEPARTURE, animations)
     player_shots, cpu_shots = {}, {}
-    cpu = CPU(rng, player.size)
+    cpu = CPU(rng, player.size, difficulty=difficulty)
     turn = 0
     if not player.has_offense():
         print('この艦隊には攻撃手段がありません。出撃しましたが戦闘不能で敗北です。')
