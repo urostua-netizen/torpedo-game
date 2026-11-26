@@ -102,8 +102,8 @@ class TorpedoGameTests(unittest.TestCase):
         self.assertNotIn('radar', fleet.available())
         self.assertFalse(fleet.use_ammo('radar'))
 
-    def test_five_ship_types_and_three_ship_limit(self):
-        self.assertEqual(len(SHIP_TYPES), 5)
+    def test_eight_ship_types_and_three_ship_limit(self):
+        self.assertEqual(len(SHIP_TYPES), 8)
         with patch('builtins.input', side_effect=['4 5 3']):
             with redirect_stdout(StringIO()):
                 ships = choose_fleet()
